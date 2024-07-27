@@ -1,120 +1,229 @@
-use axum::{extract::Path, routing::get, routing::post, Router, http::StatusCode, response::{
-    IntoResponse,
-    Response
-}, Extension};
-use jsonwebtoken::{
-    encode,EncodingKey,Header
+use axum::{
+    extract::{Json, Extension,State},
+    routing::post,
+    Router,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    BoxError,
+    handler::Handler,
 };
-use std::net::SocketAddr;
-use webbrowser;
-use std::time::{
-    SystemTime,
-    UNIX_EPOCH
-};
-use sqlx::{Executor, MySql, Pool};
+use chrono::NaiveDateTime;
+use jsonwebtoken::{encode, EncodingKey, Header};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sqlx::{MySql, Pool, FromRow, Executor};
 use dotenv::dotenv;
 use std::env;
-use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use axum::handler::HandlerWithoutStateExt;
+use axum::routing::get;
+use bcrypt::{hash, DEFAULT_COST};
+use bcrypt::verify;
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+}
 
-#[derive(Debug,Serialize,Deserialize)]
-struct  Claims{
-    sub:String,
-    exp:u64
+#[derive(Debug, Deserialize)]
+struct AuthPayload {
+    username: String,
+    password: String,
 }
-#[derive(Debug,Deserialize)]
-struct  AuthPayload{
-    username:String,
-    password:String
+
+#[derive(Debug, Deserialize)]
+struct RegisterPayload {
+    username: String,
+    password: String,
 }
-#[derive(Debug,Serialize)]
-struct  TokenResponse{
-    token:String
+
+#[derive(Debug, Serialize)]
+struct TokenResponse {
+    token: String,
+    data: UserData,
 }
-//自定义响应体
+
+#[derive(Debug, Serialize)]
+struct UserData {
+    username: String,
+    created_at: String,
+    updated_at: String,
+}
+
 #[derive(Debug, Serialize)]
 struct CustomResponse {
     code: u16,
     message: String,
+    data: serde_json::Value,
 }
 
-impl IntoResponse for CustomResponse{
-     fn into_response(self)->Response{
-         let status_code=StatusCode::from_u16(self.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let body=serde_json::to_string(&self).unwrap();
-         (status_code,body).into_response()
-     }
-}
-
-
-async  fn get_foo() -> &'static str {
-    "Hello, World! axum"
-}
-
-async fn get_foo_age_string(Path(age):Path<i32>)->impl  IntoResponse{
-    let response = if age >= 80 {
-        "找阿姨"
-    } else if age >= 50 {
-        "找富婆去吧"
-    } else if age >= 30 {
-        "快去找女人吧"
-    } else if age >= 18 {
-        "快去找工作吧"
-    } else {
-        "快去嫖娼吧"
-    };
-
-    response.to_string()
-}
-async fn post_foo()->String{
-    String::from("Hello, World! axum")
-}
-#[tokio::main]
-async fn main() {
-    dotenv().ok();
-
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let pool = Pool::<MySql>::connect(&database_url).await.expect("Failed to connect to the database");
-
-    // 手动创建用户表
-    create_db_table(&pool).await.expect("Failed to create users table");
-
-    let app = Router::new().route("/", get(get_foo)).layer(Extension(pool))
-        .route("/age/:age", get(get_foo_age_string))
-        .route("/post_foo", post(post_foo))
-        ;
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-
-    // 打开默认浏览器访问地址
-    webbrowser::open("http://127.0.0.1:3000").unwrap();
-
-    axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
-}
-
-
-fn generate_token(username:String,password:String)->Result<String,CustomResponse>{
-    if username.is_empty() || password.is_empty(){
-        return Err(
-            CustomResponse{
-                code:500,
-                message:"用户名或密码不能为空".to_string()
-            }
-        );
+impl IntoResponse for CustomResponse {
+    fn into_response(self) -> Response {
+        let status_code = StatusCode::from_u16(self.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&self).unwrap();
+        (status_code, body).into_response()
     }
-    let now=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    Ok(encode(
-        &Header::default(),
-        &Claims{
-            sub:username,
-            exp:now+60*60
+}
+
+#[derive(Debug, FromRow)]
+struct User {
+    id: i32,
+    username: String,
+    password: String,
+    created_at: NaiveDateTime,
+    updated_at: NaiveDateTime,
+}
+impl User {
+    async fn find_by_username(pool: &Pool<MySql>, username: &str) -> Result<Option<Self>, CustomResponse> {
+        sqlx::query_as::<_, User>(r#"
+            SELECT id, username, password, created_at, updated_at
+            FROM users WHERE username = ?
+        "#)
+            .bind(username)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| CustomResponse {
+                code: 500,
+                message: format!("数据库查询失败: {}", e),
+                data: json!({}),
+            })
+    }
+
+    async fn create(pool: &Pool<MySql>, username: &str, password: &str) -> Result<(), CustomResponse> {
+        let hashed_password = hash(password, DEFAULT_COST).map_err(|_| CustomResponse {
+            code: 500,
+            message: "密码加密失败".to_string(),
+            data: json!({}),
+        })?;
+
+        sqlx::query("INSERT INTO users (username, password) VALUES (?, ?)")
+            .bind(username)
+            .bind(hashed_password)
+            .execute(pool)
+            .await
+            .map_err(|_| CustomResponse {
+                code: 500,
+                message: "创建用户失败".to_string(),
+                data: json!({}),
+            })?;
+        Ok(())
+    }
+}
+async  fn get_foo() -> &'static str {
+    "Hello, World! 这是一个简单的网页代码而已"
+}
+async fn user_register_handler(
+    State(pool): State<Pool<MySql>>,
+    Json(payload): Json<RegisterPayload>,
+) -> impl IntoResponse {
+    if payload.username.is_empty() || payload.password.is_empty() {
+        return CustomResponse {
+            code: 400,
+            message: "用户名或者密码不能为空".to_string(),
+            data: json!({}),
+        }
+            .into_response();
+    }
+
+    match User::find_by_username(&pool, &payload.username).await {
+        Ok(Some(_)) => CustomResponse {
+            code: 400,
+            message: "用户名已存在".to_string(),
+            data: json!({}),
+        }
+            .into_response(),
+        Ok(None) => match User::create(&pool, &payload.username, &payload.password).await {
+            Ok(_) => CustomResponse {
+                code: 200,
+                message: "用户注册成功".to_string(),
+                data: json!({}),
+            }
+                .into_response(),
+            Err(err) => err.into_response(),
         },
-        &EncodingKey::from_secret(password.as_bytes())
-    ).unwrap())
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn user_login_handler(
+    State(pool): State<Pool<MySql>>,
+    Json(payload): Json<AuthPayload>,
+) -> impl IntoResponse {
+    match generate_token(&payload.username, &payload.password, &pool).await {
+        Ok(token_response) => (
+            StatusCode::OK,
+            Json(token_response),
+        ).into_response(),
+        Err(custom_response) => custom_response.into_response(),
+    }
 }
 
 
+async fn generate_token(
+    username: &str,
+    password: &str,
+    pool: &Pool<MySql>,
+) -> Result<TokenResponse, CustomResponse> {
+    if username.is_empty() || password.is_empty() {
+        return Err(CustomResponse {
+            code: 400,
+            message: "用户名或者密码不能为空".to_string(),
+            data: json!({}),
+        });
+    }
 
-async fn create_user_db(pool: &Pool<MySql>) -> Result<(), sqlx::Error>{
-    // 检查表是否存在
+    match User::find_by_username(pool, username).await {
+        Ok(Some(user)) => {
+
+            if verify(password, &user.password).unwrap_or(false) {
+                let expiration = (SystemTime::now() + Duration::from_secs(30 * 24 * 60 * 60))
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards")
+                    .as_secs() as usize;
+
+                let claims = Claims {
+                    sub: user.username.clone(),
+                    exp: expiration,
+                };
+
+                let secret_key = env::var("SECRET_KEY").expect("SECRET_KEY must be set");
+                let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(secret_key.as_ref()))
+                    .map_err(|_| CustomResponse {
+                        code: 500,
+                        message: "生成token令牌失败".to_string(),
+                        data: json!({}),
+                    })?;
+
+                let user_data = UserData {
+                    username: user.username,
+                    created_at: user.created_at.to_string(),
+                    updated_at: user.updated_at.to_string(),
+                };
+
+                Ok(TokenResponse {
+                    token,
+                    data: user_data,
+                })
+            } else {
+                Err(CustomResponse {
+                    code: 401,
+                    message: "用户名或密码无效".to_string(),
+                    data: json!({}),
+                })
+            }
+        },
+        Ok(None) => Err(CustomResponse {
+            code: 404,
+            message: "用户名不存在".to_string(),
+            data: json!({}),
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+
+async fn create_user_db(pool: &Pool<MySql>) -> Result<(), CustomResponse> {
     let table_exists: (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*)
@@ -124,12 +233,14 @@ async fn create_user_db(pool: &Pool<MySql>) -> Result<(), sqlx::Error>{
         "#
     )
         .fetch_one(pool)
-        .await?;
+        .await
+        .map_err(|_| CustomResponse {
+            code: 500,
+            message: "数据库查询错误".to_string(),
+            data: json!({}),
+        })?;
 
-    // 如果表不存在，则创建它
     if table_exists.0 == 0 {
-
-
         pool.execute(
             r#"
             CREATE TABLE users (
@@ -140,12 +251,19 @@ async fn create_user_db(pool: &Pool<MySql>) -> Result<(), sqlx::Error>{
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )
             "#
-        ).await?;
-    };
+        )
+            .await
+            .map_err(|_| CustomResponse {
+                code: 500,
+                message: "无法创建表".to_string(),
+                data: json!({}),
+            })?;
+    }
+
     Ok(())
 }
-async fn create_note_db(pool: &Pool<MySql>) -> Result<(), sqlx::Error>{
-    // 检查笔记表是否存在
+
+async fn create_note_db(pool: &Pool<MySql>) -> Result<(), CustomResponse> {
     let notes_table_exists: (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*)
@@ -155,30 +273,62 @@ async fn create_note_db(pool: &Pool<MySql>) -> Result<(), sqlx::Error>{
         "#
     )
         .fetch_one(pool)
-        .await?;
+        .await
+        .map_err(|_| CustomResponse {
+            code: 500,
+            message: "数据库查询错误".to_string(),
+            data: json!({}),
+        })?;
 
-    // 如果笔记表不存在，则创建它
     if notes_table_exists.0 == 0 {
         pool.execute(
             r#"
             CREATE TABLE notes (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-               title VARCHAR(30) NOT NULL,
+                user_id INT NOT NULL,
+                title VARCHAR(30) NOT NULL,
                 content VARCHAR(500) NOT NULL,
                 is_del INT NOT NULL DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
             )
             "#
-        ).await?;
+        )
+            .await
+            .map_err(|_| CustomResponse {
+                code: 500,
+                message: "创建表失败".to_string(),
+                data: json!({}),
+            })?;
     }
 
     Ok(())
 }
 
-async fn create_db_table(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
-    // 检查表是否存在
+async fn create_db_table(pool: &Pool<MySql>) -> Result<(), CustomResponse> {
     create_user_db(pool).await?;
     create_note_db(pool).await?;
     Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    dotenv().ok();
+
+    let database_url = env::var("DATABASE_URL").expect("必须设置DATABASE_URL");
+    let pool = Pool::<MySql>::connect(&database_url).await.expect("无法连接到数据库");
+
+    create_db_table(&pool).await.expect("无法创建表");
+
+    let app = Router::new().route("/", get(get_foo)).layer(Extension(pool.clone()))
+        .route("/register", post(user_register_handler))
+        .route("/login", post(user_login_handler))
+        .with_state(pool);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+
+    println!("Listening on http://{}", addr);
+
+    axum::Server::bind(&addr).serve(app.into_make_service()).await.unwrap();
 }
