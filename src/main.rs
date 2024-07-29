@@ -181,7 +181,7 @@ impl UserNote {
                 message: "获取成功".to_string(),
             }),
             None => Err(CustomResponse {
-                code: 404,
+                code: 400,
                 message: "未找到符合条件的笔记".to_string(),
                 data: serde_json::json!({}),
             }),
@@ -317,7 +317,7 @@ LIMIT ? OFFSET ?",
                     })
                 },
                 None => Err(CustomResponse {
-                    code: 404,
+                    code: 400,
                     message: "未找到符合条件的笔记".to_string(),
                     data: serde_json::json!({}),
                 })
@@ -396,7 +396,7 @@ LIMIT ? OFFSET ?",
                     },
                     None => {
                         Err(CustomResponse {
-                            code: 404,
+                            code: 400,
                             message: "笔记不存在".to_string(),
                             data: serde_json::json!({}),
                         })
